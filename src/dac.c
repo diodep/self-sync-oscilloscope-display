@@ -240,9 +240,8 @@ static void gpio_config(void)
 
 uint8_t framebuffer[1024]; //128*64 fb
 uint16_t waveform[2][1048]; //4场扫描
-volatile uint8_t read_buf = 0;
-volatile uint8_t write_buf = 0;
-volatile uint8_t req_render = 0;
+//volatile uint8_t read_buf = 0;
+//volatile uint8_t write_buf = 0;
 
 static void dac_setup(void)
 {
@@ -275,15 +274,18 @@ void dma1_channel2_3_isr(void)
 			dma_set_number_of_data(DMA1,DMA_CHANNEL3, 1024);
 			dma_enable_channel(DMA1,DMA_CHANNEL3);
 #endif
-					
-		read_buf = (read_buf == 1)? 0 : 1;
-		write_buf = (read_buf == 1)? 0 : 1;
+		//if(rend_done)
+		//{			
+			//read_buf = (read_buf == 1)? 0 : 1;
+			//write_buf = (read_buf == 1)? 0 : 1;
 			
-		dma_disable_channel(DMA1,DMA_CHANNEL3);
-		dma_set_memory_address(DMA1,DMA_CHANNEL3,(uint32_t) waveform[read_buf]);
-		dma_enable_channel(DMA1,DMA_CHANNEL3);
-		DAC_STATUS = 0xffffffff; //清除翻车位
-		req_render = 1;
+			dma_disable_channel(DMA1,DMA_CHANNEL3);
+			//dma_set_memory_address(DMA1,DMA_CHANNEL3,(uint32_t) waveform[read_buf]);
+			dma_enable_channel(DMA1,DMA_CHANNEL3);
+			DAC_STATUS = 0xffffffff; //清除翻车位
+			//req_render = 1;
+			//rend_done = 0;
+		//}
 		dma_clear_interrupt_flags(DMA1,DMA_CHANNEL3,DMA_TCIF);
 			
 	}
@@ -300,16 +302,16 @@ static void dma_setup(void)
 	dma_set_memory_size(DMA1,DMA_CHANNEL3,DMA_CCR_MSIZE_16BIT);
 	dma_set_peripheral_size(DMA1,DMA_CHANNEL3,DMA_CCR_PSIZE_16BIT);
 	dma_enable_memory_increment_mode(DMA1,DMA_CHANNEL3);
-	dma_enable_circular_mode(DMA1,DMA_CHANNEL3);
+	//dma_enable_circular_mode(DMA1,DMA_CHANNEL3);
 	dma_set_read_from_memory(DMA1,DMA_CHANNEL3);
 	
 	dma_set_peripheral_address(DMA1,DMA_CHANNEL3,(uint32_t) &DAC_DHR12R1);
 	
 	dma_set_memory_address(DMA1,DMA_CHANNEL3,(uint32_t) waveform[0]);
-	dma_set_number_of_data(DMA1,DMA_CHANNEL3, 1048);
-	dma_enable_transfer_complete_interrupt(DMA1, DMA_CHANNEL3);
-	dma_enable_channel(DMA1,DMA_CHANNEL3);
-	nvic_enable_irq(NVIC_DMA1_CHANNEL2_3_IRQ);
+	dma_set_number_of_data(DMA1,DMA_CHANNEL3, 131);
+	//dma_enable_transfer_complete_interrupt(DMA1, DMA_CHANNEL3);
+	//dma_enable_channel(DMA1,DMA_CHANNEL3);
+	//nvic_enable_irq(NVIC_DMA1_CHANNEL2_3_IRQ);
 }
 
 static void timer_setup(void)
@@ -328,7 +330,7 @@ static void timer_setup(void)
 	timer_disable_oc_preload(TIM2, TIM_OC1);
 	timer_set_oc_slow_mode(TIM2, TIM_OC1);
 	timer_set_oc_mode(TIM2, TIM_OC1, TIM_OCM_TOGGLE);
-	timer_set_oc_value(TIM2, TIM_OC1, 7);
+	timer_set_oc_value(TIM2, TIM_OC1, 2);
 	timer_disable_preload(TIM2);
 /* Set the timer trigger output (for the DAC) to the channel 1 output compare */
 	timer_set_master_mode(TIM2, TIM_CR2_MMS_COMPARE_OC1REF);
@@ -451,42 +453,72 @@ int main(void)
 		waveform[0][1 + 131 * scan] = 0;
 		waveform[0][2 + 131 * scan] = 256;		
 	}
+	uint8_t read_buf = 0;
+	uint8_t write_buf = 1;
+	
+	dma_enable_channel(DMA1,DMA_CHANNEL3);
+	DAC_STATUS = 0xffffffff;
 
 	while (1)
 	{
 #if 1
-		if(req_render)
+		uint16_t sample;
+		d = 0;
+		if(write_buf != read_buf)
 		{
-			uint16_t sample;
-			d = 0;
-
-			for(scan = 0; scan < 8; scan++)
+			for(scan = 0; scan < 1; scan++)
 			{
-				//waveform[write_buf][d++] = 256;
-				//waveform[write_buf][d++] = 0x00;
-				//waveform[write_buf][d++] = 256;
 				d += 3;
 				for(x = 0; x < 128; x ++)
 				{
 				#if 1
 					if(framebuffer[(y >> 3) * 128 + x] & (1 << (y & 0x07)))
-						sample = 2048 - 24 * y;
+						sample = 1536 - 20 * y;
 					else
-						sample = 256;
+					{ //如果下行也白
+						uint16_t yd = y > 64? 64: y + 1;
+						uint16_t yp = y > 1? y - 1: 1;
+						if(framebuffer[(yd >> 3) * 128 + x] & (1 << (yd & 0x07)))
+							sample = 1536 - 20 * yd;
+						else if (framebuffer[(yp >> 3) * 128 + x] & (1 << (yp & 0x07)))
+							sample = 1536 - 20 * yp;
+						else
+							sample = 256;
+					}
 
 					waveform[write_buf][d++] = sample;
 				#endif
 					//waveform[write_buf][d++] = 2048;
-					
+				
 				}
 				y ++;
 				if(y > 63)
 					y = 0;
 
 			}
-
-			req_render = 0;
+			write_buf ++;
+			if(write_buf > 1) write_buf = 0;
 		}
+		
+		if(dma_get_interrupt_flag(DMA1, DMA_CHANNEL3, DMA_TCIF))
+		{
+			dma_clear_interrupt_flags(DMA1,DMA_CHANNEL3,DMA_TCIF);
+			
+			dma_disable_channel(DMA1,DMA_CHANNEL3);
+			if(write_buf == read_buf)
+				dma_set_memory_address(DMA1,DMA_CHANNEL3,(uint32_t) waveform[read_buf]);
+			dma_enable_channel(DMA1,DMA_CHANNEL3);
+			DAC_STATUS = 0xffffffff;
+			
+			if(write_buf == read_buf)
+			{				
+				read_buf++;
+				if(read_buf > 1) read_buf = 0;
+			}
+		}
+		
+		
+		
 #endif
 
 	}
