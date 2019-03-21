@@ -27,6 +27,7 @@
 #include <libopencm3/cm3/scb.h>
 #include <libopencm3/cm3/nvic.h>
 #include <libopencm3/cm3/systick.h>
+#include <libopencm3/stm32/flash.h>
 #include <string.h>
 #include <stdio.h>
 
@@ -235,25 +236,57 @@ static void gpio_config(void)
 	GPIOA_CTL &= ~(1 << 8);//PA8推挽输出	
 	
 	GPIOA_CTL |= (0x03) << (4 * 2); //PA4模拟模式
+#if 0
+	GPIOA_CTL |= (0x02) << (6 * 2); //PA6 TIM2_CH1
+	GPIOA_AFSEL0 |= (0x01) << (6 * 4); //PA6 AFIO 1
+#else
+	GPIOA_CTL &= ~((0x03 << (6 * 2)));
+#endif
 }
 
 
 uint8_t framebuffer[1024]; //128*64 fb
-uint16_t waveform[2][1048]; //4场扫描
-//volatile uint8_t read_buf = 0;
-//volatile uint8_t write_buf = 0;
+uint16_t waveform[2][140]; //4场扫描
+volatile uint8_t read_buf = 0;
+volatile uint8_t write_buf = 0;
+volatile uint8_t req_rend = 0;
+volatile uint8_t rend_done = 0;
 
 static void dac_setup(void)
 {
 	/* Enable the DAC clock */
 	rcc_periph_clock_enable(RCC_DAC);
 	dac_trigger_enable(CHANNEL_1);
-	dac_set_trigger_source(DAC_CR_TSEL1_T2 | DAC_CR_TSEL2_T2);
+	dac_set_trigger_source(DAC_CR_TSEL1_T3);
 	dac_dma_enable(CHANNEL_1);
 	dac_enable(CHANNEL_1);
 }
 
 void dma1_channel2_3_isr(void)
+{
+	//if (dma_get_interrupt_flag(DMA1, DMA_CHANNEL3, DMA_TCIF))
+	//{
+	if (DMA_ISR(DMA1) & (DMA_HTIF << DMA_FLAG_OFFSET(DMA_CHANNEL3)))
+	{
+		write_buf = 0;
+		
+		req_rend = 1;
+		rend_done = 0;
+		
+		dma_clear_interrupt_flags(DMA1, DMA_CHANNEL3, DMA_HTIF);
+	}
+	else if (dma_get_interrupt_flag(DMA1, DMA_CHANNEL3, DMA_TCIF))
+	{
+		write_buf = 1;
+		
+		req_rend = 1;
+		rend_done = 0;
+		
+		dma_clear_interrupt_flags(DMA1, DMA_CHANNEL3, DMA_TCIF);
+	}
+}
+
+void sys_tick_handler(void)
 {
 	if (dma_get_interrupt_flag(DMA1, DMA_CHANNEL3, DMA_TCIF))
 	{
@@ -273,23 +306,29 @@ void dma1_channel2_3_isr(void)
 			dma_set_memory_address(DMA1,DMA_CHANNEL3,(uint32_t) waveform[read_buf]);
 			dma_set_number_of_data(DMA1,DMA_CHANNEL3, 1024);
 			dma_enable_channel(DMA1,DMA_CHANNEL3);
-#endif
+
 		//if(rend_done)
 		//{			
 			//read_buf = (read_buf == 1)? 0 : 1;
 			//write_buf = (read_buf == 1)? 0 : 1;
-			
+		//	if(rend_done)
+		//		read_buf = write_buf;
+				
 			dma_disable_channel(DMA1,DMA_CHANNEL3);
-			//dma_set_memory_address(DMA1,DMA_CHANNEL3,(uint32_t) waveform[read_buf]);
+			dma_set_memory_address(DMA1,DMA_CHANNEL3,(uint32_t) waveform[write_buf]);
+			while((STK_CVR & STK_CVR_CURRENT) > 14200);
 			dma_enable_channel(DMA1,DMA_CHANNEL3);
+			DMA_CCR(DMA1, DMA_CHANNEL3) |= DMA_CCR_EN;
 			DAC_STATUS = 0xffffffff; //清除翻车位
-			//req_render = 1;
-			//rend_done = 0;
+			req_rend = 1;
+			rend_done = 0;
 		//}
 		dma_clear_interrupt_flags(DMA1,DMA_CHANNEL3,DMA_TCIF);
-			
+#endif			
 	}
 }
+
+
 
 static void dma_setup(void)
 {
@@ -302,39 +341,41 @@ static void dma_setup(void)
 	dma_set_memory_size(DMA1,DMA_CHANNEL3,DMA_CCR_MSIZE_16BIT);
 	dma_set_peripheral_size(DMA1,DMA_CHANNEL3,DMA_CCR_PSIZE_16BIT);
 	dma_enable_memory_increment_mode(DMA1,DMA_CHANNEL3);
-	//dma_enable_circular_mode(DMA1,DMA_CHANNEL3);
+	dma_enable_circular_mode(DMA1,DMA_CHANNEL3);
 	dma_set_read_from_memory(DMA1,DMA_CHANNEL3);
 	
 	dma_set_peripheral_address(DMA1,DMA_CHANNEL3,(uint32_t) &DAC_DHR12R1);
 	
-	dma_set_memory_address(DMA1,DMA_CHANNEL3,(uint32_t) waveform[0]);
-	dma_set_number_of_data(DMA1,DMA_CHANNEL3, 131);
-	//dma_enable_transfer_complete_interrupt(DMA1, DMA_CHANNEL3);
-	//dma_enable_channel(DMA1,DMA_CHANNEL3);
-	//nvic_enable_irq(NVIC_DMA1_CHANNEL2_3_IRQ);
+	dma_set_memory_address(DMA1,DMA_CHANNEL3,(uint32_t) waveform);
+	dma_set_number_of_data(DMA1,DMA_CHANNEL3, 280);
+
+	dma_enable_half_transfer_interrupt(DMA1, DMA_CHANNEL3);
+	dma_enable_transfer_complete_interrupt(DMA1, DMA_CHANNEL3);
+	dma_enable_channel(DMA1,DMA_CHANNEL3);
+	nvic_enable_irq(NVIC_DMA1_CHANNEL2_3_IRQ);
 }
 
 static void timer_setup(void)
 {
 /* Enable TIM2 clock. */
-	rcc_periph_clock_enable(RCC_TIM2);
-	timer_reset(TIM2);
+	rcc_periph_clock_enable(RCC_TIM3);
+	timer_reset(TIM3);
 /* Timer global mode: - No divider, Alignment edge, Direction up */
-	timer_set_mode(TIM2, TIM_CR1_CKD_CK_INT,
+	timer_set_mode(TIM3, TIM_CR1_CKD_CK_INT,
 		       TIM_CR1_CMS_EDGE, TIM_CR1_DIR_UP);
-	timer_continuous_mode(TIM2);
-	timer_set_period(TIM2, 14);
-	timer_disable_oc_output(TIM2, TIM_OC2 | TIM_OC3 | TIM_OC4);
-	timer_enable_oc_output(TIM2, TIM_OC1);
-	timer_disable_oc_clear(TIM2, TIM_OC1);
-	timer_disable_oc_preload(TIM2, TIM_OC1);
-	timer_set_oc_slow_mode(TIM2, TIM_OC1);
-	timer_set_oc_mode(TIM2, TIM_OC1, TIM_OCM_TOGGLE);
-	timer_set_oc_value(TIM2, TIM_OC1, 2);
-	timer_disable_preload(TIM2);
+	timer_continuous_mode(TIM3);
+	timer_set_period(TIM3, 40);
+	timer_disable_oc_output(TIM3, TIM_OC2 | TIM_OC3 | TIM_OC4);
+	timer_enable_oc_output(TIM3, TIM_OC1);
+	timer_disable_oc_clear(TIM3, TIM_OC1);
+	timer_disable_oc_preload(TIM3, TIM_OC1);
+	timer_set_oc_slow_mode(TIM3, TIM_OC1);
+	timer_set_oc_mode(TIM3, TIM_OC1, TIM_OCM_TOGGLE);
+	timer_set_oc_value(TIM3, TIM_OC1, 2);
+	timer_disable_preload(TIM3);
 /* Set the timer trigger output (for the DAC) to the channel 1 output compare */
-	timer_set_master_mode(TIM2, TIM_CR2_MMS_COMPARE_OC1REF);
-	timer_enable_counter(TIM2);
+	timer_set_master_mode(TIM3, TIM_CR2_MMS_COMPARE_OC1REF);
+	timer_enable_counter(TIM3);
 }
 
 uint8_t rx_status = 0;
@@ -395,12 +436,70 @@ static void cdcacm_set_config(usbd_device *usbd_dev, uint16_t wValue)
 	configured = 1;
 }
 
+void rcc_clock_setup_in_hse_8mhz_out_120mhz(void)
+{
+	/* Enable internal high-speed oscillator. */
+	rcc_osc_on(RCC_HSI);
+	rcc_wait_for_osc_ready(RCC_HSI);
+
+	/* Select HSI as SYSCLK source. */
+	rcc_set_sysclk_source(RCC_CFGR_SW_SYSCLKSEL_HSICLK);
+
+	/* Enable external high-speed oscillator 8MHz. */
+	rcc_osc_on(RCC_HSE);
+	rcc_wait_for_osc_ready(RCC_HSE);
+	rcc_set_sysclk_source(RCC_CFGR_SW_SYSCLKSEL_HSECLK);
+	
+	RCC_CFGR |= (RCC_CFGR_USBPRE_PLL_CLK_DIV2_5 << 22); /* USB DIV 2.5 */
+
+	/*
+	 * Set prescalers for AHB, ADC, ABP1, ABP2.
+	 * Do this before touching the PLL (TODO: why?).
+	 */
+	rcc_set_hpre(RCC_CFGR_HPRE_SYSCLK_NODIV);    /* Set. 120MHz Max. 120MHz */
+	rcc_set_adcpre(RCC_CFGR_ADCPRE_PCLK2_DIV8);  /* Set.  9MHz Max. 14MHz */
+	rcc_set_ppre1(RCC_CFGR_PPRE1_HCLK_DIV2);     /* Set. 60MHz Max. 36MHz */
+	rcc_set_ppre2(RCC_CFGR_PPRE2_HCLK_DIV2);    /* Set. 60MHz Max. 72MHz */
+
+	/*
+	 * GD32F1x0 series has no waitstates.
+	 */
+	flash_set_ws(FLASH_ACR_LATENCY_0WS);
+
+	/*
+	 * Set the PLL multiplication factor to 15.
+	 * 8MHz (external) * 15 (multiplier) = 120MHz
+	 */
+	rcc_set_pll_multiplication_factor(RCC_CFGR_PLLMUL_PLL_CLK_MUL15);
+
+	/* Select HSE as PLL source. */
+	rcc_set_pll_source(RCC_CFGR_PLLSRC_HSE_CLK);
+
+	/*
+	 * External frequency undivided before entering PLL
+	 * (only valid/needed for HSE).
+	 */
+	rcc_set_pllxtpre(RCC_CFGR_PLLXTPRE_HSE_CLK);
+
+	/* Enable PLL oscillator and wait for it to stabilize. */
+	rcc_osc_on(RCC_PLL);
+	rcc_wait_for_osc_ready(RCC_PLL);
+
+	/* Select PLL as SYSCLK source. */
+	rcc_set_sysclk_source(RCC_CFGR_SW_SYSCLKSEL_PLLCLK);
+
+	/* Set the peripheral clock frequencies used */
+	rcc_ahb_frequency = 120000000;
+	rcc_apb1_frequency = 30000000;
+	rcc_apb2_frequency = 60000000;
+}
 
 int main(void)
 {
 	int i;
 
-	rcc_clock_setup_in_hse_8mhz_out_72mhz();
+	//rcc_clock_setup_in_hse_8mhz_out_72mhz();
+	rcc_clock_setup_in_hse_8mhz_out_120mhz();
 	SCB_VTOR = 0x08000000;
 
 	rcc_periph_clock_enable(RCC_GPIOA);
@@ -425,8 +524,17 @@ int main(void)
 	nvic_enable_irq(NVIC_USB_HP_CAN_TX_IRQ);
 	nvic_enable_irq(NVIC_USB_LP_CAN_RX0_IRQ);
 	nvic_enable_irq(NVIC_USB_WAKEUP_IRQ);
-
-	nvic_set_priority(NVIC_DMA1_CHANNEL2_3_IRQ, 0);//DMA最高优先级
+#if 0
+	systick_set_clocksource(STK_CSR_CLKSOURCE_AHB); /* 72MHz / 8 = 9MHz */
+	/* 定时器每N次中断一次 */
+	systick_set_reload(14400); /* 9000 / 9000 = 1kHz */
+	systick_interrupt_enable();
+	systick_counter_enable();
+	nvic_set_priority(NVIC_SYSTICK_IRQ, 0);//systick最高
+#else
+	nvic_set_priority(NVIC_DMA1_CHANNEL2_3_IRQ, 1);//DMA最高优先级
+#endif
+	
 	nvic_set_priority(NVIC_USB_WAKEUP_IRQ, 1 << 4);
 	nvic_set_priority(NVIC_USB_LP_CAN_RX0_IRQ, 1 << 4);
 	nvic_set_priority(NVIC_USB_HP_CAN_TX_IRQ, 1 << 4);
@@ -440,21 +548,34 @@ int main(void)
 	DAC_STATUS = 0xffffffff;
 
 	__asm__("cpsie i"); //开中断
-	
+#if 1
 	uint16_t x = 0, y = 0, scan = 0;
 	uint16_t d = 0;
-	for(scan = 0; scan < 8; scan++)
-	{
-		waveform[1][0 + 131 * scan] = 256;
-		waveform[1][1 + 131 * scan] = 0;
-		waveform[1][2 + 131 * scan] = 256;
 
-		waveform[0][0 + 131 * scan] = 256;
-		waveform[0][1 + 131 * scan] = 0;
-		waveform[0][2 + 131 * scan] = 256;		
+	waveform[1][0] = 256;
+	waveform[1][1] = 0;
+	waveform[1][2] = 256;
+	
+
+	waveform[0][0] = 256;
+	waveform[0][1] = 0;
+	waveform[0][2] = 256;
+	
+	for(d = 131; d < sizeof(waveform) / 2 / 2; d++)
+	{
+		waveform[0][d] = 256;
+		waveform[1][d] = 256;
 	}
-	uint8_t read_buf = 0;
-	uint8_t write_buf = 1;
+	
+#else
+	uint16_t x = 0, y = 0, scan = 0;
+	uint16_t d = 0;
+	for(scan = 0; scan < 1024; scan++)
+	{
+		waveform[0][scan] = scan * 3;//% 16 * 255;
+		waveform[1][scan] = 4095 - scan * 4;//% 16 * 255;
+	}	
+#endif
 	
 	dma_enable_channel(DMA1,DMA_CHANNEL3);
 	DAC_STATUS = 0xffffffff;
@@ -464,8 +585,9 @@ int main(void)
 #if 1
 		uint16_t sample;
 		d = 0;
-		if(write_buf != read_buf)
+		if(req_rend == 1)
 		{
+
 			for(scan = 0; scan < 1; scan++)
 			{
 				d += 3;
@@ -483,7 +605,10 @@ int main(void)
 						else if (framebuffer[(yp >> 3) * 128 + x] & (1 << (yp & 0x07)))
 							sample = 1536 - 20 * yp;
 						else
-							sample = 256;
+							//if(y < 32)
+							//	sample = 1536;
+							//else
+								sample = 256;
 					}
 
 					waveform[write_buf][d++] = sample;
@@ -496,25 +621,8 @@ int main(void)
 					y = 0;
 
 			}
-			write_buf ++;
-			if(write_buf > 1) write_buf = 0;
-		}
-		
-		if(dma_get_interrupt_flag(DMA1, DMA_CHANNEL3, DMA_TCIF))
-		{
-			dma_clear_interrupt_flags(DMA1,DMA_CHANNEL3,DMA_TCIF);
-			
-			dma_disable_channel(DMA1,DMA_CHANNEL3);
-			if(write_buf == read_buf)
-				dma_set_memory_address(DMA1,DMA_CHANNEL3,(uint32_t) waveform[read_buf]);
-			dma_enable_channel(DMA1,DMA_CHANNEL3);
-			DAC_STATUS = 0xffffffff;
-			
-			if(write_buf == read_buf)
-			{				
-				read_buf++;
-				if(read_buf > 1) read_buf = 0;
-			}
+			req_rend = 0;
+			rend_done = 1;
 		}
 		
 		
